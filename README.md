@@ -63,6 +63,24 @@ The service exposes:
   - The response body is plain text containing only the answer
 - `GET /health` for a simple readiness check
 
+To ingest source code, enable the feature with either:
+
+- the `--code-graph` server flag
+- `SMART_ASSIST_CODE_GRAPH=1`
+
+When code graph ingestion is enabled, the loader automatically scans `.py` and `.java` files in directory inputs, and you can force code-only mode with `source_type: "code"`. For Java, it now focuses on class and method nodes plus method-call relations, and it captures method annotations such as `@GetMapping` and `@PostMapping` as node metadata. That is a better fit for Spring Boot controllers and service methods. Java parsing uses `javalang` when available, with a regex fallback for basic structure if it is not installed. Symbols are indexed across the Java files in the same ingest batch so method calls can resolve across files.
+
+For a lighter code-graph workflow, you can export a compact metadata JSON first and ingest that later:
+
+```bash
+python -m smart_assist.cli code-export --input path/to/code --output-dir out
+python -m smart_assist.cli code-ingest --input out/code_graph_metadata_*.json
+```
+
+The exported JSON keeps only document, entity, and relation metadata needed to rebuild the code graph. It focuses on module, class, method, and function nodes, plus `contains` and `calls` links.
+For Java sources, the export also preserves method annotations and Spring-style endpoint details such as `@GetMapping` paths and HTTP methods.
+Controller classes carry a small `spring` block with controller/stereotype and base-path information.
+
 The UI in `smart_assist_ui` expects the backend at `http://localhost:8000` and uploads one or more files to `POST /ingest`.
 
 ## Supported Inputs
