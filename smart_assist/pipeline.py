@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from .code_graph import CodeGraphIngestor
 from .embeddings import TfidfEmbeddingEngine
 from .extractor import EntityRelationExtractor
 from .graph_store import KnowledgeGraph, Neo4jGraphStore
@@ -35,15 +36,22 @@ class _RagContext:
 
 
 class SmartAssistPipeline:
-    def __init__(self) -> None:
+    def __init__(self, enable_code_graph: Optional[bool] = None) -> None:
         self.extractor = EntityRelationExtractor()
         self.embeddings = TfidfEmbeddingEngine()
         self.graph = KnowledgeGraph()
         self.documents: List[Document] = []
+        self.code_graph = CodeGraphIngestor(enabled=self._resolve_code_graph_enabled(enable_code_graph))
         self._openai_client = self._build_openai_client()
         self._answer_model = os.getenv("KG_OPENAI_ANSWER_MODEL", os.getenv("KG_OPENAI_MODEL", "gpt-4.1-mini"))
         self.neo4j_store = self._build_neo4j_store()
         self.neo4j_enabled = self.neo4j_store is not None
+
+    def _resolve_code_graph_enabled(self, explicit: Optional[bool]) -> bool:
+        if explicit is not None:
+            return explicit
+        value = os.getenv("SMART_ASSIST_CODE_GRAPH", os.getenv("KG_CODE_GRAPH", "0"))
+        return value.strip().lower() in {"1", "true", "yes", "on"}
 
     def _build_neo4j_store(self) -> Optional[Neo4jGraphStore]:
         uri = os.getenv("NEO4J_URI")
@@ -58,11 +66,24 @@ class SmartAssistPipeline:
                 return None
         return None
 
-    def load_documents(self, source: object) -> List[Document]:
+    def load_documents(self, source: object, source_type: str = "auto") -> List[Document]:
+        normalized_source_type = source_type.strip().lower()
+        if normalized_source_type == "code":
+            if not self.code_graph.enabled:
+                raise RuntimeError(
+                    "Code graph ingestion is disabled. Enable SMART_ASSIST_CODE_GRAPH or pass enable_code_graph=True."
+                )
+            return self.code_graph.load_documents(source)
+
         if isinstance(source, (str, Path)):
             path = Path(source)
             if path.is_dir():
-                return self._load_documents_from_directory(path)
+                documents = self._load_documents_from_directory(path)
+                if self.code_graph.enabled:
+                    documents.extend(self.code_graph.load_documents(path))
+                return documents
+            if self.code_graph.enabled and path.suffix.lower() in {".py", ".java"}:
+                return self.code_graph.load_documents(path)
             return self._load_documents_from_file(path)
 
         if isinstance(source, dict):
@@ -269,12 +290,16 @@ class SmartAssistPipeline:
         texts = [doc.text for doc in documents]
         self.embeddings.fit(texts)
 
-        results: List[ExtractionResult] = []
+        results: List[Optional[ExtractionResult]] = [None] * len(documents)
+        code_documents: list[tuple[int, Document]] = []
 
-        for document in documents:
+        for index, document in enumerate(documents):
+            if self.code_graph.should_handle(document):
+                code_documents.append((index, document))
+                continue
             self.graph.add_document(document)
             extracted = self.extractor.extract(document)
-            results.append(extracted)
+            results[index] = extracted
 
             for entity in extracted.entities:
                 self.graph.add_entity(entity)
@@ -283,18 +308,31 @@ class SmartAssistPipeline:
             for relation in extracted.relations:
                 self.graph.add_relation(relation)
 
+        if code_documents:
+            code_results = self.code_graph.ingest_documents([document for _, document in code_documents], self.graph)
+            for (index, _), result in zip(code_documents, code_results):
+                results[index] = result
+
         self._add_similarity_edges(documents)
         if self.neo4j_store:
             try:
                 self.neo4j_store.sync(self.graph)
             except Exception as exc:
                 warnings.warn(f"Neo4j sync failed; graph was not persisted: {exc}", RuntimeWarning)
-        return results
+        return [result for result in results if result is not None]
 
     def _add_similarity_edges(self, documents: Sequence[Document]) -> None:
         for i, left in enumerate(documents):
             for j in range(i + 1, len(documents)):
                 right = documents[j]
+                left_kind = str(left.metadata.get("kind", "text")).lower()
+                right_kind = str(right.metadata.get("kind", "text")).lower()
+                if left_kind != right_kind:
+                    continue
+                if left_kind == "code" and str(left.metadata.get("language", "")).lower() != str(
+                    right.metadata.get("language", "")
+                ).lower():
+                    continue
                 score = self.embeddings.similarity(left.text, right.text)
                 if score >= 0.18:
                     self.graph.add_similarity(left.id, right.id, score, "document_embeddings")
@@ -604,6 +642,7 @@ class SmartAssistPipeline:
             "entities": len(self.graph.entities()),
             "relations": len(self.graph.relations()),
             "neo4j_enabled": self.neo4j_enabled,
+            "code_graph_enabled": self.code_graph.enabled,
         }
 
     def close(self) -> None:

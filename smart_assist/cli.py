@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .code_graph import CodeGraphIngestor
 from .pipeline import SmartAssistPipeline
 
 
@@ -13,12 +14,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="Ingest documents and build the graph")
     ingest.add_argument("--input", required=True, help="Path to a folder or file with documents")
+    ingest.add_argument(
+        "--source-type",
+        default="auto",
+        choices=["auto", "text", "code"],
+        help="How to interpret the input path",
+    )
 
     query = subparsers.add_parser("query", help="Run a graph query against ingested data")
     query.add_argument("--input", required=False, help="Path to a folder or file with documents")
     query.add_argument("--text", required=True, help="Query text")
+    query.add_argument(
+        "--source-type",
+        default="auto",
+        choices=["auto", "text", "code"],
+        help="How to interpret the input path",
+    )
 
     demo = subparsers.add_parser("demo", help="Run the app against bundled sample data")
+
+    code_export = subparsers.add_parser("code-export", help="Export code graph metadata to JSON")
+    code_export.add_argument("--input", required=True, help="Path to a folder or file with source code")
+    code_export.add_argument(
+        "--output-dir",
+        default=".",
+        help="Directory where the timestamped metadata JSON file should be written",
+    )
+
+    code_ingest = subparsers.add_parser("code-ingest", help="Ingest previously exported code graph metadata JSON")
+    code_ingest.add_argument("--input", required=True, help="Path to the code graph metadata JSON file")
 
     return parser
 
@@ -27,6 +51,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     pipeline = SmartAssistPipeline()
+    code_graph = CodeGraphIngestor(enabled=True)
 
     try:
         if args.command == "demo":
@@ -46,8 +71,29 @@ def main() -> None:
                 print()
             return
 
+        if args.command == "code-export":
+            output_path = code_graph.export_metadata(args.input, output_dir=Path(args.output_dir))
+            print(json.dumps({"output_file": str(output_path)}, indent=2))
+            return
+
+        if args.command == "code-ingest":
+            metadata_pipeline = SmartAssistPipeline(enable_code_graph=True)
+            metadata_pipeline.extractor._client = None
+            metadata_pipeline._openai_client = None
+            try:
+                code_graph.ingest_metadata(args.input, metadata_pipeline.graph)
+                if metadata_pipeline.neo4j_store:
+                    try:
+                        metadata_pipeline.neo4j_store.sync(metadata_pipeline.graph)
+                    except Exception as exc:
+                        print(f"Neo4j sync failed: {exc}")
+                print(json.dumps(metadata_pipeline.export_summary(), indent=2))
+            finally:
+                metadata_pipeline.close()
+            return
+
         if getattr(args, "input", None):
-            documents = pipeline.load_documents(args.input)
+            documents = pipeline.load_documents(args.input, source_type=getattr(args, "source_type", "auto"))
             pipeline.ingest(documents)
 
         if args.command == "ingest":

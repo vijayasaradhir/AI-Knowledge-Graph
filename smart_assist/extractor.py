@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -178,6 +179,7 @@ class EntityRelationExtractor:
             return json.loads(content)
         except Exception as exc:
             print(f"error working with llm {exc}")
+            traceback.print_exc()
             return None
 
     def _extract_with_fallback(self, document: Document) -> ExtractionResult:

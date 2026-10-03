@@ -15,8 +15,12 @@ from .pipeline import SmartAssistPipeline
 
 
 class SmartAssistService:
-    def __init__(self, pipeline: Optional[SmartAssistPipeline] = None) -> None:
-        self.pipeline = pipeline or SmartAssistPipeline()
+    def __init__(
+        self,
+        pipeline: Optional[SmartAssistPipeline] = None,
+        enable_code_graph: Optional[bool] = None,
+    ) -> None:
+        self.pipeline = pipeline or SmartAssistPipeline(enable_code_graph=enable_code_graph)
         self._lock = threading.RLock()
 
     def ingest_from_documents(self, documents: list[Any]) -> dict[str, Any]:
@@ -28,18 +32,18 @@ class SmartAssistService:
                 "results": [self._serialize_extraction(result) for result in results],
             }
 
-    def ingest_from_path(self, source: str | Path) -> dict[str, Any]:
-        documents = self.pipeline.load_documents(source)
+    def ingest_from_path(self, source: str | Path, source_type: str = "auto") -> dict[str, Any]:
+        documents = self.pipeline.load_documents(source, source_type=source_type)
         return self.ingest_from_documents(documents)
 
-    def ingest_from_uploads(self, uploads: list[tuple[str, bytes]]) -> dict[str, Any]:
+    def ingest_from_uploads(self, uploads: list[tuple[str, bytes]], source_type: str = "auto") -> dict[str, Any]:
         with tempfile.TemporaryDirectory(prefix="smart-assist-upload-") as temp_dir_name:
             temp_dir = Path(temp_dir_name)
             for index, (filename, payload) in enumerate(uploads, start=1):
                 safe_name = Path(filename or f"upload-{index}").name or f"upload-{index}"
                 target = temp_dir / f"{index:03d}_{safe_name}"
                 target.write_bytes(payload)
-            return self.ingest_from_path(temp_dir)
+            return self.ingest_from_path(temp_dir, source_type=source_type)
 
     def query(self, text: str, top_k: int = 5) -> dict[str, Any]:
         with self._lock:
@@ -152,25 +156,27 @@ class SmartAssistRequestHandler(BaseHTTPRequestHandler):
         raise ValueError("Unsupported content type. Use application/json or multipart/form-data.")
 
     def _ingest_from_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_type = str(payload.get("source_type", "auto")).strip().lower()
         if "documents" in payload:
-            documents = self.service.pipeline.load_documents(payload["documents"])
+            documents = self.service.pipeline.load_documents(payload["documents"], source_type=source_type)
             return self.service.ingest_from_documents(documents)
         if "input" in payload:
-            return self.service.ingest_from_path(payload["input"])
+            return self.service.ingest_from_path(payload["input"], source_type=source_type)
         raise ValueError("Provide either 'documents' or 'input' in the request body.")
 
     def _ingest_from_form(self, form: cgi.FieldStorage) -> dict[str, Any]:
+        source_type = self._form_value(form, "source_type") or "auto"
         uploads = self._extract_uploads(form)
         if uploads:
-            return self.service.ingest_from_uploads(uploads)
+            return self.service.ingest_from_uploads(uploads, source_type=source_type)
 
         input_path = self._form_value(form, "input")
         if input_path:
-            return self.service.ingest_from_path(input_path)
+            return self.service.ingest_from_path(input_path, source_type=source_type)
 
         documents_raw = self._form_value(form, "documents")
         if documents_raw:
-            documents = self.service.pipeline.load_documents(json.loads(documents_raw))
+            documents = self.service.pipeline.load_documents(json.loads(documents_raw), source_type=source_type)
             return self.service.ingest_from_documents(documents)
 
         raise ValueError("Upload one or more files or provide an 'input' field.")
@@ -180,11 +186,12 @@ class SmartAssistRequestHandler(BaseHTTPRequestHandler):
         if not text:
             raise ValueError("The query endpoint requires a non-empty 'text' field.")
         top_k = int(payload.get("top_k", 5))
+        source_type = str(payload.get("source_type", "auto")).strip().lower()
         if "documents" in payload:
-            documents = self.service.pipeline.load_documents(payload["documents"])
+            documents = self.service.pipeline.load_documents(payload["documents"], source_type=source_type)
             self.service.ingest_from_documents(documents)
         elif "input" in payload:
-            self.service.ingest_from_path(payload["input"])
+            self.service.ingest_from_path(payload["input"], source_type=source_type)
         return self.service.query(text, top_k=top_k)["answer"]
 
     def _query_from_form(self, form: cgi.FieldStorage) -> str:
@@ -193,17 +200,18 @@ class SmartAssistRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("The query endpoint requires a non-empty 'text' field.")
         top_k_raw = self._form_value(form, "top_k")
         top_k = int(top_k_raw) if top_k_raw else 5
+        source_type = self._form_value(form, "source_type") or "auto"
 
         uploads = self._extract_uploads(form)
         if uploads:
-            self.service.ingest_from_uploads(uploads)
+            self.service.ingest_from_uploads(uploads, source_type=source_type)
         else:
             input_path = self._form_value(form, "input")
             if input_path:
-                self.service.ingest_from_path(input_path)
+                self.service.ingest_from_path(input_path, source_type=source_type)
             documents_raw = self._form_value(form, "documents")
             if documents_raw:
-                documents = self.service.pipeline.load_documents(json.loads(documents_raw))
+                documents = self.service.pipeline.load_documents(json.loads(documents_raw), source_type=source_type)
                 self.service.ingest_from_documents(documents)
 
         return self.service.query(text, top_k=top_k)["answer"]
@@ -260,13 +268,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="smart-assist-server", description="Smart Assist REST service")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind")
     parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
+    code_graph_group = parser.add_mutually_exclusive_group()
+    code_graph_group.add_argument("--code-graph", dest="code_graph", action="store_true", help="Enable source code graph ingestion")
+    code_graph_group.add_argument("--no-code-graph", dest="code_graph", action="store_false", help="Disable source code graph ingestion")
+    parser.set_defaults(code_graph=None)
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    service = SmartAssistService()
+    service = SmartAssistService(enable_code_graph=args.code_graph)
     server = ThreadingHTTPServer((args.host, args.port), SmartAssistRequestHandler)
     server.service = service  # type: ignore[attr-defined]
     print(f"Smart Assist REST service running on http://{args.host}:{args.port}")
